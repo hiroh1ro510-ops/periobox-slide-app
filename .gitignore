@@ -1,0 +1,28 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Runtime state
+.auth_state/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# 症例サンプル（患者データを含みうる・公開リポジトリには入れない）
+samples/
+.dev.vars
+*.pem
+*key*.json
+credentials*.json

@@ -9,6 +9,14 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 from auth import get_secret_value, load_local_env, require_authorized_user
 from openai import OpenAI, OpenAIError
+from schemas import (
+    STUDY_TYPE_CLASSES,
+    STUDY_TYPE_LABEL_JA,
+    FAITHFUL_SUMMARY_JSON_SHAPE,
+    SLIDE_SUMMARY_JSON_SHAPE,
+    STUDY_TYPE_VERIFIER_JSON_SHAPE,
+)
+from renderers import dispatcher as slide_dispatcher
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -127,6 +135,7 @@ def build_section_extraction_prompt(pdf_text: str) -> str:
 - セクションが本文から見つからない場合は「本文から判別困難」とする。
 - Introduction/Backgroundは特に丁寧に抽出する。
 - Methods/Resultsでは対象、介入、比較、評価項目、数値、P値、CIを残す。
+- 分類・カテゴリ・型（Class A-/A+/B-/B+、Type I/II、Stage、Grade、意思決定ツリーの分岐条件など）が本文に登場する場合、その **完全な名称一覧と各カテゴリの定義**を Methods または Results の要約に必ず残す。省略・要約しない。
 - Discussion/Conclusionでは著者の解釈と限界を分ける。
 
 JSONスキーマ:
@@ -165,44 +174,64 @@ PDF本文:
 
 
 def build_faithful_summary_prompt(sections: Dict[str, Any]) -> str:
+    classes = " | ".join(STUDY_TYPE_CLASSES)
     return f"""
 以下は歯科医療論文PDFからセクション別に抽出した内容です。
 これをもとに、原文に忠実な日本語の構造化要約を作成してください。
 
 目的:
-- PerioBoxスライド化の前段階として、翻訳精度を上げる。
+- PerioBoxスライド化の前段階として、翻訳精度と構造精度を上げる。
+- スライド2枚目（研究デザイン）・3枚目（結果）を「見本と同じ骨格」で描けるだけの構造情報を残す。
 - 原文の意味、対象、方法、結果、限界、数値を落とさない。
 
 厳守事項:
 - 出力はJSONのみ。
 - この段階ではスライド用に過度に短縮しない。
-- 不明点は「本文から判別困難」と書く。
+- 不明点は「本文から判別困難」と書く（数値フィールドは空文字でよい）。
 - introduction_jaはIntroduction/Backgroundのみをもとに約400字で書く。
 - methods_ja/results_ja/discussion_jaは原文に忠実に、臨床的に重要な情報を残す。
 - 著者の結論と、あなたの臨床解釈を混ぜない。
 
+study_type_class の分類ルール:
+- rct: 明確なランダム化割り付けを持つ介入試験。
+- prospective_cohort: 前向きに追跡する観察・介入研究（ランダム化なし）。
+- retrospective_comparative: 既存データ・カルテを後ろ向きに解析する比較研究。
+- cross_sectional: 一時点での測定・相関研究。
+- systematic_review: PICO・網羅的検索・選定フロー・複数研究の統合を伴うレビュー。メタアナリシスも含む。
+- narrative_review: 系統的検索を伴わない総説・分類スキームレビュー。
+- mechanism: 組織学・分子生物学・in vitro など機序解明研究。
+- case_report: 単一または少数例の臨床報告。
+選択に迷ったら、より狭い（下側の）分類を優先しない。まず研究デザイン記述（Methods冒頭）を最優先の根拠にする。
+
+パターン別拡張の埋め方（**該当パターンだけ埋め、他は必ず空配列 [] または空オブジェクト {{}} にする。「不明」「本文から判別困難」等の文字列で埋めない**）:
+- groups: 比較群がある研究（rct / prospective_cohort / retrospective_comparative / mechanism）で必ず埋める。各群の name / n / intervention_or_exposure を書く。
+- comparison_matrix: 群 × 指標の対比表が Results から読み取れて **具体数値・所見が本文に literal に書かれている時のみ**埋める。cells には「値21」「基準値」「平均値」のようなプレースホルダを絶対に入れない。数値が本文にない場合は comparison_matrix 全体を空オブジェクト {{}} にする。
+- pico: **study_type_class が systematic_review の時のみ**埋める。search_flow に identified/screened/included の数値を入れる。
+- classification_tree: **study_type_class が narrative_review かつ分類スキーム・意思決定ツリー・カテゴリ分類が明確に本文にある時のみ**埋める。retrospective_comparative や systematic_review では絶対に埋めない。
+  - narrative_review の場合は classification_tree を**必ず埋める努力をする**。Methods または Results に "classification", "classified according to", "decision tree", "分類", "class A/B/…", "Type I/II/…", "Stage", "Grade" 等が現れたら該当箇所を classification_tree にマッピングする。nodes は階層で持ち、上位ノード label = 分類軸名、下位ノード label = カテゴリ名。Class A-/A+/B-/B+/V字型のような臨床分類は必ず nodes として展開する。source_quote には分類語が現れる英語1文を入れる。
+- case_report: **study_type_class が case_report の時のみ**埋める。他パターンでは空オブジェクト {{}}。
+
+過剰埋め禁止の原則:
+- 該当しないパターン拡張フィールドは「不明」で埋めず、空 {{}} または [] で返すこと。
+- comparison_matrix の cells は本文に literal な数値が確認できたセルだけ書く。片方だけ埋まる場合は matrix 全体を空にしてよい。
+
+原文根拠（source_quote / source_page）:
+- study_type_class の根拠、各群の記述、comparison_matrix の値、pico、classification_tree、case_report、figure_refs、これらすべてに「英語原文の1文」を source_quote として引用する。
+- source_page は本文ページ番号（数値、不明なら 0）。
+- 引用は改変せず本文からの literal 引用に限る。
+
+design_common:
+- subjects_short は 1〜2行、methods_short は 3〜5行に収める。
+- evaluation_items は下部ピル用の短語（例: "PD", "CAL", "MBL", "診断速度", "診断精度"）。日本語略称または頭字語 3〜6個。
+- figure_refs は Methods の該当図（研究デザイン図・シェーマ・フローチャート・撮影スキーム等）を優先。
+
+result_common:
+- main_conclusion_ja は 1〜3文。統計的有意差の有無を含める。
+- detail_note_ja は「さらに詳しく」欄に載せる補足で 1〜2文。
+- figure_refs は Results の主要結果に関連する図表を優先。
+
 JSONスキーマ:
-{{
-  "paper": {{
-    "title_en": "英語タイトル",
-    "citation_short": "筆頭著者 et al. ジャーナル名. 年",
-    "article_type": "論文タイプ"
-  }},
-  "faithful_summary": {{
-    "introduction_ja": "Introductionを約400字で忠実に要約",
-    "clinical_question_source": "本文から導ける臨床疑問",
-    "methods_ja": "Methodsの忠実な日本語要約",
-    "participants_ja": "対象",
-    "interventions_or_groups_ja": ["群・介入・曝露1", "群・介入・曝露2"],
-    "outcomes_ja": ["評価項目1", "評価項目2"],
-    "results_ja": "Resultsの忠実な日本語要約",
-    "key_numeric_data_ja": ["数値1", "数値2", "数値3"],
-    "statistical_notes_ja": ["統計1", "統計2"],
-    "discussion_ja": "Discussionの忠実な日本語要約",
-    "limitations_ja": ["限界1", "限界2"],
-    "figures_tables_ja": "図表の忠実な日本語要約"
-  }}
-}}
+{FAITHFUL_SUMMARY_JSON_SHAPE.replace("rct | prospective_cohort | retrospective_comparative | cross_sectional | systematic_review | narrative_review | mechanism | case_report", classes)}
 
 セクション別抽出JSON:
 {json.dumps(sections, ensure_ascii=False)}
@@ -210,6 +239,7 @@ JSONスキーマ:
 
 
 def build_slide_prompt(faithful_summary: Dict[str, Any]) -> str:
+    classes = " | ".join(STUDY_TYPE_CLASSES)
     return f"""
 あなたは歯周病学・インプラント周囲疾患に詳しい歯科医師向け論文解説者です。
 以下の「原文に忠実な日本語構造化要約」から、実際のPerioBox抄読スライドに近い4枚構成PowerPoint用の日本語要約を作成してください。
@@ -229,66 +259,31 @@ def build_slide_prompt(faithful_summary: Dict[str, Any]) -> str:
 - article_typeはレビュー論文なら Systematic Review / Meta-Analysis / Literature Review / Narrative Review など、レビュー以外なら RCT / Retrospective study / Case report / Experimental study などと明確に書く。
 - selection_pointsは「①」「②」を付けず、短い2項目にする。
 - doctor_commentは臨床家が読む自然な長めのコメントにする。限界にも触れ、安易な臨床応用を避ける。
-- 研究論文のslide2.design_summaryは「比較研究」などの曖昧な説明ではなく、論文内で言及されている可能性が高い一般的な研究デザイン名にする。例: ランダム化比較試験、後ろ向きコホート研究、前向きコホート研究、横断研究、症例対照研究、in vitro比較研究。
-- slide2.outcomesは、論文内で使われている略称があれば必ず日本語名の後ろに括弧で付ける。例: プロービングデプス（PD）、臨床的アタッチメントレベル（CAL）、辺縁骨レベル（MBL）、出血（BOP）。
-- 研究論文のslide2.design_schemaは、2枚目中段にPowerPointの編集可能な図形（角丸四角、矢印、テキスト）で組める範囲の図・表として再構成できる形で書く。
-- 比較試験では、何と何を比較しているか、対象から評価までの流れ、群分け、評価タイミングが視覚的に分かるようにする。
-- slide2.design_schema.stepsは中段の流れ、groupsは比較群、labelsは図中ラベルに使える短語にする。
-- 研究論文のslide3.main_resultsは、統計的有意差がある結果を優先してメインに記載する。
-- slide3.main_resultsの各項目には、有意差があったかどうかを本文の表現に沿って必ず含める。例: 「〜は有意に改善した（p<0.05）」「〜に有意差は認められなかった」。
-- 有意差が本文から判別困難な場合は「有意差は本文から判別困難」と添える。
-- 研究論文のslide3.evidence_schemaは、Results内の主要結果に関連するFigure/Tableの内容を参考にしつつ、著作物を複製せず、PowerPointの編集可能な図形・表・テキストで作れる範囲の根拠表として再構成できる形で書く。
-- evidence_schema.itemsは、比較軸・評価項目・数値・統計・臨床的解釈が伝わる3〜4項目に絞る。
+
+スライド2枚目（研究デザイン）:
+- slide2.study_type_class は faithful_summary の study_type_class をそのまま入れる。
+- slide2.study_type_label は faithful_summary の study_type_label_ja をベースに、サブタイトルピル用の短文（20字以内目安）。
+- slide2.design_summary は一般的な研究デザイン名（例: ランダム化比較試験、後ろ向きコホート研究、in vitro比較研究）。
+- slide2.outcomesは、論文内で使われている略称があれば必ず日本語名の後ろに括弧で付ける（例: プロービングデプス（PD）、臨床的アタッチメントレベル（CAL））。
+- slide2.design_schema は 2枚目中段に角丸四角・矢印・テキストで組める図として再構成できる形で書く（steps は流れ、groups は比較群、labels は短語）。
+- slide2.pattern_extensions.groups_detail は比較群がある研究で埋める（name / n / intervention_or_exposure）。
+- slide2.pattern_extensions.pico は systematic_review の時のみ埋める。
+- slide2.pattern_extensions.classification_tree は narrative_review かつ分類スキームがある時のみ埋める。
+- slide2.pattern_extensions.case_report は case_report の時のみ埋める。
+- slide2.figure_refs は faithful_summary.design_common.figure_refs をそのまま渡す。
+
+スライド3枚目（結果）:
+- slide3.main_results は統計的有意差がある結果を優先し、各項目に有意差の有無を必ず含める（例: 「〜は有意に改善した（p<0.05）」「〜に有意差は認められなかった」）。有意差が本文から判別困難な場合は「有意差は本文から判別困難」と添える。
+- slide3.evidence_schema は Results 内の主要結果に関連するFigure/Tableを参考に、複製せず角丸四角・表・テキストで作れる根拠表として再構成する。items は 3〜4項目に絞る。
+- slide3.pattern_extensions.comparison_matrix は、群 × 指標の対比表が本文から読み取れる時に埋める（case01の「AIモデル vs 専門医」×「診断速度/精度」型）。cells は rows × columns の2次元配列。有意差記述は significance_note に。
+- slide3.pattern_extensions.case_report は case_report の時のみ埋める。
+- slide3.figure_refs は faithful_summary.result_common.figure_refs をそのまま渡す。
+- slide3.more_detail は faithful_summary.result_common.detail_note_ja をベースに 1〜2文。
+
+分類候補: {classes}
 
 JSONスキーマ:
-{{
-  "paper": {{
-    "title_en": "英語論文タイトル",
-    "citation": "筆頭著者 et al. ジャーナル名. 年",
-    "article_type": "RCT / Systematic Review / Retrospective study / Case report 等"
-  }},
-  "slide1": {{
-    "clinical_question_jp": "日本語の問い",
-    "key_message_jp": "問いへの結論を1文で",
-    "background_heading": "論文の背景と概要",
-    "background_overview": "Introductionを中心に、臨床上の課題・既存知見・未解決点・本研究目的を約400字で要約"
-  }},
-  "slide2": {{
-    "design_summary": "一般的な研究デザイン名。例: ランダム化比較試験、後ろ向きコホート研究、in vitro比較研究",
-    "participants": "対象患者・対象資料",
-    "selection_criteria": ["選定条件1", "選定条件2", "除外条件1"],
-    "methods": ["方法1", "方法2", "方法3"],
-    "groups_or_comparison": ["群分け・比較1", "群分け・比較2"],
-    "outcomes": ["評価項目1（略称）", "評価項目2（略称）", "評価項目3（略称）"],
-    "design_schema": {{
-      "title": "中段図表の短いタイトル",
-      "steps": ["対象/処置の流れ1", "流れ2", "流れ3"],
-      "groups": [
-        {{"name": "群・比較対象1", "description": "短い説明"}},
-        {{"name": "群・比較対象2", "description": "短い説明"}}
-      ],
-      "labels": ["図中ラベル1", "図中ラベル2"]
-    }}
-  }},
-  "slide3": {{
-    "main_results": ["統計的有意差の有無を含む主な結果1", "統計的有意差の有無を含む主な結果2", "統計的有意差の有無を含む主な結果3"],
-    "key_numbers": ["重要な数値1", "重要な数値2", "重要な数値3"],
-    "statistical_notes": ["統計的有意差・P値1", "統計的有意差・P値2"],
-    "evidence_schema": {{
-      "title": "主要結果の根拠を示す短いタイトル",
-      "items": [
-        {{"label": "比較軸・評価項目", "value": "数値または所見", "interpretation": "臨床的な読み取り"}},
-        {{"label": "比較軸・評価項目", "value": "数値または所見", "interpretation": "臨床的な読み取り"}}
-      ]
-    }},
-    "more_detail": "さらに詳しく：図表や補足結果の要約を1〜2文"
-  }},
-  "slide4": {{
-    "selection_points": ["論文選定のポイント1", "論文選定のポイント2"],
-    "doctor_comment": "抄読ドクターからひとこと。臨床的意義、使いどころ、注意点、限界を含めて5〜8文",
-    "limitations": ["限界1", "限界2"]
-  }}
-}}
+{SLIDE_SUMMARY_JSON_SHAPE.replace("rct | prospective_cohort | retrospective_comparative | cross_sectional | systematic_review | narrative_review | mechanism | case_report", classes)}
 
 原文に忠実な日本語構造化要約JSON:
 {json.dumps(faithful_summary, ensure_ascii=False)}
@@ -311,6 +306,93 @@ def create_faithful_summary_with_openai(client: OpenAI, model: str, sections: Di
         "あなたは歯科医療論文を原文に忠実に日本語へ構造化要約する専門家です。",
         build_faithful_summary_prompt(sections),
     )
+
+
+def build_study_type_verifier_prompt(faithful_summary: Dict[str, Any], sections: Dict[str, Any]) -> str:
+    classes = " | ".join(STUDY_TYPE_CLASSES)
+    fs = faithful_summary.get("faithful_summary", {}) if isinstance(faithful_summary, dict) else {}
+    first_class = fs.get("study_type_class", "")
+    first_label = fs.get("study_type_label_ja", "")
+    first_evidence = fs.get("study_type_evidence", {})
+    methods_ja = fs.get("methods_ja", "")
+    section_methods = ""
+    if isinstance(sections, dict):
+        section_methods = sections.get("sections", {}).get("methods", "") or ""
+    return f"""
+歯科医療論文の研究デザイン分類を検証してください。
+
+1回目の分類:
+- study_type_class: {first_class}
+- study_type_label_ja: {first_label}
+- source_quote: {first_evidence.get("source_quote", "")}
+- source_page: {first_evidence.get("source_page", "")}
+
+Methods（日本語忠実要約）:
+{methods_ja}
+
+Methods（英語原文抽出）:
+{section_methods}
+
+分類候補: {classes}
+
+分類ルール:
+- rct: 明確なランダム化割り付けあり。
+- prospective_cohort: 前向き追跡、ランダム化なし。
+- retrospective_comparative: 既存データ・カルテを後ろ向き解析。
+- cross_sectional: 一時点測定・相関。
+- systematic_review: PICO・網羅検索・選定フローあり。メタアナリシス含む。
+- narrative_review: 系統的検索なしの総説・分類スキームレビュー。
+- mechanism: 組織学・分子・in vitro など機序研究。
+- case_report: 単一/少数例の臨床報告。
+
+判定手順:
+1. Methods の記述を読み、上記候補のうち最も妥当なものを選ぶ。
+2. 1回目の分類と一致するなら verdict = "correct"。
+3. 一致しないが正しい分類が確定できるなら、それに置き換え verdict = "corrected"。
+4. Methods 記述だけでは決められないなら verdict = "uncertain" とし、study_type_class は1回目の値をそのまま返す。
+5. 根拠として、Methods 英語原文から literal な英語 1文を source_quote に引用する。改変不可。
+
+出力はJSONのみ。次のスキーマ:
+{STUDY_TYPE_VERIFIER_JSON_SHAPE.replace("rct | prospective_cohort | retrospective_comparative | cross_sectional | systematic_review | narrative_review | mechanism | case_report", classes)}
+""".strip()
+
+
+def verify_study_type_with_openai(
+    client: OpenAI, model: str, faithful_summary: Dict[str, Any], sections: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Run a second LLM pass that verifies (and possibly corrects) study_type_class.
+
+    Returns the (possibly updated) ``faithful_summary`` dict. Adds a
+    ``study_type_verification`` key holding the verifier's raw output for
+    traceability.
+    """
+    if not isinstance(faithful_summary, dict) or "faithful_summary" not in faithful_summary:
+        return faithful_summary
+    try:
+        verdict = call_openai_json(
+            client,
+            model,
+            "あなたは医学研究デザインの分類を検証する疫学専門家です。原文根拠のみを重視し、推測しません。",
+            build_study_type_verifier_prompt(faithful_summary, sections),
+        )
+    except Exception:
+        return faithful_summary
+    fs = faithful_summary["faithful_summary"]
+    fs["study_type_verification"] = verdict
+    new_class = str(verdict.get("study_type_class", "")).strip()
+    new_label = str(verdict.get("study_type_label_ja", "")).strip()
+    verdict_kind = str(verdict.get("verdict", "")).strip()
+    if verdict_kind == "corrected" and new_class in STUDY_TYPE_CLASSES:
+        fs["study_type_class"] = new_class
+        if new_label:
+            fs["study_type_label_ja"] = new_label
+        elif new_class in STUDY_TYPE_LABEL_JA:
+            fs["study_type_label_ja"] = STUDY_TYPE_LABEL_JA[new_class]
+        fs["study_type_evidence"] = {
+            "source_quote": verdict.get("source_quote", ""),
+            "source_page": verdict.get("source_page", 0),
+        }
+    return faithful_summary
 
 
 def create_slide_summary_with_openai(client: OpenAI, model: str, faithful_summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -936,7 +1018,7 @@ def add_pdf_reference_image(
 
 
 def normalize_design_schema(summary: Dict[str, Any]) -> Dict[str, Any]:
-    slide2 = summary.get("slide2", {})
+    slide2 = summary.get("slide2", {}) if isinstance(summary, dict) else {}
     schema = slide2.get("design_schema") if isinstance(slide2, dict) else {}
     if not isinstance(schema, dict):
         schema = {}
@@ -946,17 +1028,41 @@ def normalize_design_schema(summary: Dict[str, Any]) -> Dict[str, Any]:
         steps = as_list(slide2.get("methods"))[:4]
 
     groups: List[Dict[str, str]] = []
-    raw_groups = schema.get("groups")
-    if isinstance(raw_groups, list):
-        for item in raw_groups:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                description = str(item.get("description", "")).strip()
+
+    # 1st: pattern_extensions.groups_detail (new richer schema)
+    ext = slide2.get("pattern_extensions") if isinstance(slide2, dict) else None
+    ext_groups = ext.get("groups_detail") if isinstance(ext, dict) else None
+    if isinstance(ext_groups, list):
+        for item in ext_groups:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            n = str(item.get("n", "")).strip()
+            desc = str(item.get("intervention_or_exposure", "")).strip()
+            if n and desc:
+                description = f"n={n}／{desc}"
+            elif n:
+                description = f"n={n}"
             else:
-                name = str(item).strip()
-                description = ""
+                description = desc
             if name or description:
                 groups.append({"name": name or "比較群", "description": description})
+
+    # 2nd: legacy design_schema.groups
+    if not groups:
+        raw_groups = schema.get("groups")
+        if isinstance(raw_groups, list):
+            for item in raw_groups:
+                if isinstance(item, dict):
+                    name = str(item.get("name", "")).strip()
+                    description = str(item.get("description", "")).strip()
+                else:
+                    name = str(item).strip()
+                    description = ""
+                if name or description:
+                    groups.append({"name": name or "比較群", "description": description})
+
+    # 3rd: fallback to slide2.groups_or_comparison list
     if not groups:
         for item in as_list(slide2.get("groups_or_comparison"))[:4]:
             groups.append({"name": item, "description": ""})
@@ -1028,8 +1134,40 @@ def add_research_design_slide(slide, summary: Dict[str, Any], heading: str, pdf_
 
 
 def normalize_evidence_items(summary: Dict[str, Any]) -> List[Dict[str, str]]:
-    schema = summary.get("slide3", {}).get("evidence_schema")
+    slide3 = summary.get("slide3", {}) if isinstance(summary, dict) else {}
     items: List[Dict[str, str]] = []
+
+    # 1st: pattern_extensions.comparison_matrix (new richer schema)
+    ext = slide3.get("pattern_extensions") if isinstance(slide3, dict) else None
+    matrix = ext.get("comparison_matrix") if isinstance(ext, dict) else None
+    if isinstance(matrix, dict):
+        rows = as_list(matrix.get("rows"))
+        columns = as_list(matrix.get("columns"))
+        cells = matrix.get("cells")
+        sig_note = str(matrix.get("significance_note", "")).strip()
+        if rows and columns and isinstance(cells, list):
+            for r_idx, row_label in enumerate(rows):
+                if r_idx >= len(cells):
+                    break
+                row_cells = cells[r_idx] if isinstance(cells[r_idx], list) else []
+                value_parts = []
+                for c_idx, col_label in enumerate(columns):
+                    if c_idx >= len(row_cells):
+                        break
+                    value_parts.append(f"{col_label}: {row_cells[c_idx]}")
+                if value_parts:
+                    items.append(
+                        {
+                            "label": str(row_label),
+                            "value": " / ".join(value_parts),
+                            "interpretation": sig_note or "本文から判別困難",
+                        }
+                    )
+            if items:
+                return items[:4]
+
+    # 2nd: legacy evidence_schema.items
+    schema = slide3.get("evidence_schema")
     if isinstance(schema, dict):
         raw_items = schema.get("items", [])
         if isinstance(raw_items, list):
@@ -1240,7 +1378,15 @@ def circled_number(index: int) -> str:
     return numbers[index] if index < len(numbers) else f"{index + 1})"
 
 
-def create_pptx(summary: Dict[str, Any], box_number: str = "000", pdf_bytes: Optional[bytes] = None) -> bytes:
+def create_pptx(
+    summary: Dict[str, Any],
+    box_number: str = "000",
+    pdf_bytes: Optional[bytes] = None,
+    faithful_summary: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    if faithful_summary is not None and isinstance(summary, dict):
+        summary = dict(summary)
+        summary["_faithful_summary"] = faithful_summary
     prs = Presentation()
     prs.slide_width = Inches(10)
     prs.slide_height = Inches(7.5)
@@ -1286,7 +1432,12 @@ def create_pptx(summary: Dict[str, Any], box_number: str = "000", pdf_bytes: Opt
         add_section_heading(slide, "比較・群分け", 5.25, 3.25, 2.0)
         add_bullet_lines(slide, as_list(summary.get("slide2", {}).get("groups_or_comparison")), 5.45, 3.68, 3.75, 2.4, font_size=15)
     else:
-        add_research_design_slide(slide, summary, slide2_heading, pdf_bytes=pdf_bytes)
+        study_class = slide_dispatcher.resolve_class(summary)
+        design_render = slide_dispatcher.get_design_renderer(study_class)
+        if design_render is not None:
+            design_render(slide, summary, pdf_bytes=pdf_bytes)
+        else:
+            add_research_design_slide(slide, summary, slide2_heading, pdf_bytes=pdf_bytes)
 
     slide = prs.slides.add_slide(blank)
     add_slide_background(slide)
@@ -1298,7 +1449,12 @@ def create_pptx(summary: Dict[str, Any], box_number: str = "000", pdf_bytes: Opt
         add_section_heading(slide, "さらに詳しく", 0.62, 5.58, 1.7)
         add_multiline_text(slide, get_nested(summary, "slide3", "more_detail"), 1.65, 5.95, 7.45, 0.9, font_size=15)
     else:
-        add_research_results_slide(slide, summary, slide3_heading, pdf_bytes=pdf_bytes)
+        study_class = slide_dispatcher.resolve_class(summary)
+        result_render = slide_dispatcher.get_result_renderer(study_class)
+        if result_render is not None:
+            result_render(slide, summary, pdf_bytes=pdf_bytes)
+        else:
+            add_research_results_slide(slide, summary, slide3_heading, pdf_bytes=pdf_bytes)
 
     slide = prs.slides.add_slide(blank)
     add_slide_background(slide)
@@ -1424,11 +1580,14 @@ def main():
                     status.update(label="原文に忠実な日本語構造化要約を生成しています...")
                     faithful_summary = create_faithful_summary_with_openai(client, model, sections)
 
+                    status.update(label="研究デザイン分類を検証しています...")
+                    faithful_summary = verify_study_type_with_openai(client, model, faithful_summary, sections)
+
                     status.update(label="PerioBoxスライド用要約へ変換しています...")
                     summary = create_slide_summary_with_openai(client, model, faithful_summary)
 
                     status.update(label="PowerPointを作成しています...")
-                    pptx_bytes = create_pptx(summary, box_number=box_number, pdf_bytes=pdf_bytes)
+                    pptx_bytes = create_pptx(summary, box_number=box_number, pdf_bytes=pdf_bytes, faithful_summary=faithful_summary)
                     status.update(label="論文全文の日本語訳Markdownを生成しています...")
                     translation_markdown = create_full_translation_markdown(client, model, pdf_text, summary)
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
