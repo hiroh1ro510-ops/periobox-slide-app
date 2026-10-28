@@ -1474,12 +1474,21 @@ def create_pptx(
         margin=0,
         word_wrap=False,
     )
-    underline = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.48), Inches(0.86), Inches(2.45), Inches(0.025))
-    disable_shadow(underline)
-    underline.fill.solid()
-    underline.fill.fore_color.rgb = RGBColor(0, 160, 235)
-    underline.line.color.rgb = RGBColor(0, 160, 235)
-    underline.rotation = selection_title_rotation
+    # 見出し下線は必ず筆書き画像 selection_point_underline.png（見本「論文の選定ポイント下線.png」と同一）を使う。
+    # 単なる棒（RECTANGLE）は禁止（2026-10-28 院長指示）。画像は右上がりに描かれているので回転しない。
+    if SELECTION_POINT_UNDERLINE_PATH.exists():
+        ul_w = 2.45
+        ul_h = ul_w * 84 / 408
+        underline = slide.shapes.add_picture(str(SELECTION_POINT_UNDERLINE_PATH), Inches(0.48), Inches(0.86 - ul_h / 2 + 0.012), width=Inches(ul_w), height=Inches(ul_h))
+        underline.name = "selection_point_underline"
+        disable_shadow(underline)
+    else:
+        underline = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.48), Inches(0.86), Inches(2.45), Inches(0.025))
+        disable_shadow(underline)
+        underline.fill.solid()
+        underline.fill.fore_color.rgb = RGBColor(0, 160, 235)
+        underline.line.color.rgb = RGBColor(0, 160, 235)
+        underline.rotation = selection_title_rotation
     points = as_list(summary.get("slide4", {}).get("selection_points"))[:2]
     point_text = "\n".join(f"{circled_number(index)}{point}" for index, point in enumerate(points or ["本文から判別困難"]))
     add_multiline_text(slide, point_text, 1.35, 1.12, 7.65, 0.9, font_size=18, bold=False, line_spacing=1.05, font_name=JP_FONT_NAME)
